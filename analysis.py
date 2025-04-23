@@ -1,65 +1,68 @@
 import textstat
 from collections import Counter
+import numpy as np
 from text_processing import turkce_cumle_tokenize, turkce_kelime_tokenize
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+
+def safe_flesch_score(text):
+    """Hata yonetimli Flesch skoru hesaplama"""
+    try:
+        return textstat.flesch_reading_ease(text)
+    except Exception as e:
+        logger.warning(f"Flesch skoru hesaplanamadi: {str(e)}")
+        return 0.0
+
+def calculate_difficulty(flesch, cumle_uzunluk, kelime_sayisi, tekrar):
+    """Vektorel zorluk puani hesaplama"""
+    weights = np.array([0.4, 0.3, 0.2, 0.1])
+    scores = np.array([
+        0.8 if flesch < 40 else 0.5 if flesch < 60 else 0.2,
+        0.8 if cumle_uzunluk >= 20 else 0.5 if cumle_uzunluk >= 10 else 0.2,
+        0.8 if kelime_sayisi >= 500 else 0.5 if kelime_sayisi >= 100 else 0.2,
+        0.8 if tekrar > 10 else 0.5 if tekrar > 5 else 0.2
+    ])
+    return float(np.dot(weights, scores))
 
 def metin_analiz_et(metin):
-    cumleler = turkce_cumle_tokenize(metin)
-    kelimeler = turkce_kelime_tokenize(metin)
-    
-    kelime_sayisi = len(kelimeler)
-    cumle_sayisi = len(cumleler)
-    ort_cumle_uzunlugu = kelime_sayisi / cumle_sayisi if cumle_sayisi > 0 else 0
-    
+    """Spark uyumlu metin analiz fonksiyonu"""
     try:
-        flesch_skoru = textstat.flesch_reading_ease(metin)
-    except:
-        flesch_skoru = 0
+        if not metin or not isinstance(metin, str):
+            return default_analiz_sonucu()
         
-    kelime_sayisi_dict = Counter(kelimeler)
-    tekrar_eden_sayisi = sum(1 for count in kelime_sayisi_dict.values() if count > 1)
-    
-    if flesch_skoru > 60:
-        flesch_puan = 0.2
-    elif flesch_skoru > 40:
-        flesch_puan = 0.5
-    else:
-        flesch_puan = 0.8
-    
-    if ort_cumle_uzunlugu < 10:
-        cumle_uzunlugu_puan = 0.2
-    elif ort_cumle_uzunlugu < 20:
-        cumle_uzunlugu_puan = 0.5
-    else:
-        cumle_uzunlugu_puan = 0.8
-    
-    if kelime_sayisi < 100:
-        kelime_puan = 0.2
-    elif kelime_sayisi < 500:
-        kelime_puan = 0.5
-    else:
-        kelime_puan = 0.8
+        cumleler = turkce_cumle_tokenize(metin)
+        kelimeler = turkce_kelime_tokenize(metin)
         
-    if tekrar_eden_sayisi > 10:
-        tekrar_puan = 0.8  
-    elif tekrar_eden_sayisi > 5:
-        tekrar_puan = 0.5  
-    else:
-        tekrar_puan = 0.2  
+        kelime_sayisi = len(kelimeler)
+        cumle_sayisi = max(len(cumleler), 1)
+        ort_cumle_uzunlugu = kelime_sayisi / cumle_sayisi
+        flesch_skoru = safe_flesch_score(metin)
+        tekrar_eden = sum(1 for c in Counter(kelimeler).values() if c > 1)
+        
+        zorluk = calculate_difficulty(
+            flesch_skoru, ort_cumle_uzunlugu, 
+            kelime_sayisi, tekrar_eden
+        )
+        
+        zorluk_seviyesi = "Zor" if zorluk >= 0.6 else "Orta" if zorluk >= 0.3 else "Kolay"
+        
+        return (
+            zorluk_seviyesi,
+            int(kelime_sayisi),
+            int(cumle_sayisi),
+            float(round(ort_cumle_uzunlugu, 2)),
+            float(round(flesch_skoru, 2)),
+            int(tekrar_eden)
+        )
+        
+    except Exception as e:
+        logger.error(f"Analiz hatasi: {str(e)}")
+        return default_analiz_sonucu()
 
-    zorluk = (0.4 * flesch_puan) + (0.3 * cumle_uzunlugu_puan) + (0.2 * kelime_puan) + (0.1 * tekrar_puan)
-    
-    if zorluk < 0.3:
-        zorluk_seviyesi = "Kolay"
-    elif zorluk < 0.6:
-        zorluk_seviyesi = "Orta"
-    else:
-        zorluk_seviyesi = "Zor"
-    
-    return {
-        "zorluk": zorluk_seviyesi,
-        "kelime_sayisi": kelime_sayisi,
-        "cumle_sayisi": cumle_sayisi,
-        "ortalama_cumle_uzunlugu": ort_cumle_uzunlugu,
-        "flesch_skoru": flesch_skoru,
-        "tekrar_eden_kelime_sayisi": tekrar_eden_sayisi
-    }
+def default_analiz_sonucu():
+    """Hata durumu icin varsayilan degerler"""
+    return ("Hata", 0, 0, 0.0, 0.0, 0)
