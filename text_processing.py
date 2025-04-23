@@ -1,4 +1,6 @@
 import re
+import logging
+
 
 def turkce_cumle_tokenize(text):
     sentences = re.split(r'(?<=[.!?])\s+', text)
