@@ -1,78 +1,47 @@
 import os
+from pyspark.sql import SparkSession
+from pyspark.ml.feature import Tokenizer, VectorAssembler
+from pyspark.ml import Pipeline
+from pyspark.sql.functions import col, size, monotonically_increasing_id
+from pyspark.ml.classification import LogisticRegression
+from pyspark.ml.evaluation import MulticlassClassificationEvaluator
+from pyspark.sql.types import IntegerType
 
+#ortam degiskenleri deistirmek gerekebilir
+os.environ["HADOOP_HOME"] = "C:\\hadoop"
+os.environ["PATH"] += os.pathsep + "C:\\hadoop\\bin"
 os.environ["PYSPARK_PYTHON"] = "python"
 os.environ["PYSPARK_DRIVER_PYTHON"] = "python"
 
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, udf
-from pyspark.sql.types import StructType, StructField, StringType, IntegerType, DoubleType
-from analysis import metin_analiz_et
-
-
-
-
-
 spark = SparkSession.builder \
-    .appName("Turkce Metin Analizi") \
-    .config("spark.executor.memory", "4g") \
-    .config("spark.driver.memory", "4g") \
-    .config("spark.python.worker.memory", "2g") \
-    .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer") \
-    .config("spark.kryoserializer.buffer.max", "512m") \
+    .appName("MetinKarmasikAnalis") \
     .getOrCreate()
 
-analiz_schema = StructType([
-    StructField("zorluk", StringType()),
-    StructField("kelime_sayisi", IntegerType()),
-    StructField("cumle_sayisi", IntegerType()),
-    StructField("ortalama_cumle_uzunlugu", DoubleType()),
-    StructField("flesch_skoru", DoubleType()),
-    StructField("tekrar_eden_kelime_sayisi", IntegerType())
-])
+spark.sparkContext.setLogLevel("ERROR")
 
-metin_analiz_udf = udf(metin_analiz_et, analiz_schema)
+metinler_df = spark.read.text('metinler/*.txt')
+metinler_df = metinler_df.withColumn("id", monotonically_increasing_id())
+metinler_df.show(5)
 
-def dosya_yukle(klasor_yolu):
-    """Dosyalari Spark DataFrame'e yukleme"""
-    from pyspark.sql import Row
-    
-    veriler = []
-    for dosya in os.listdir(klasor_yolu):
-        if dosya.endswith(".txt"):
-            try:
-                with open(os.path.join(klasor_yolu, dosya), "r", encoding="utf-8") as f:
-                    icerik = f.read()
-                    zorluk = dosya.split("_")[0].lower() if "_" in dosya else "belirsiz"
-                    veriler.append(Row(
-                        dosya_adi=dosya,
-                        zorluk_etiket=zorluk,
-                        icerik=icerik
-                    ))
-            except Exception as e:
-                print(f"Hata: {dosya} yuklenemedi - {str(e)}")
-    
-    return spark.createDataFrame(veriler)
+tokenizer = Tokenizer(inputCol="value", outputCol="kelimeler")
+pipeline = Pipeline(stages=[tokenizer])
+model = pipeline.fit(metinler_df)
+processed_df = model.transform(metinler_df)
 
-def main():
-    df = dosya_yukle("texts")
-    
-    analiz_df = df.withColumn("analiz", metin_analiz_udf(col("icerik"))) \
-        .select(
-            col("dosya_adi"),
-            col("zorluk_etiket"),
-            col("analiz.zorluk").alias("tahmini_zorluk"),
-            col("analiz.kelime_sayisi"),
-            col("analiz.cumle_sayisi"),
-            col("analiz.ortalama_cumle_uzunlugu"),
-            col("analiz.flesch_skoru"),
-            col("analiz.tekrar_eden_kelime_sayisi")
-        )
-    
-    analiz_df.show(truncate=False)
-    
-    analiz_df.write.mode("overwrite").csv("sonuclar", header=True)
-    
-    spark.stop()
+processed_df = processed_df.withColumn("kelime_sayisi", size(col("kelimeler")))
 
-if __name__ == "__main__":
-    main()
+from pyspark.sql.functions import rand
+processed_df = processed_df.withColumn("karmasik_seviyesi", (rand() * 2).cast(IntegerType()))
+
+assembler = VectorAssembler(inputCols=["kelime_sayisi"], outputCol="features")
+processed_df = assembler.transform(processed_df)
+
+lr = LogisticRegression(featuresCol="features", labelCol="karmasik_seviyesi")
+model = lr.fit(processed_df)
+
+predictions = model.transform(processed_df)
+predictions.select("value", "kelime_sayisi", "prediction").show(5)
+
+evaluator = MulticlassClassificationEvaluator(labelCol="karmasik_seviyesi", predictionCol="prediction", metricName="accuracy")
+accuracy = evaluator.evaluate(predictions)
+print(f"Modelin dogrulugu: {accuracy}")
