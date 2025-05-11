@@ -1,13 +1,12 @@
 import os
 from pyspark.sql import SparkSession
-from pyspark.ml.feature import Tokenizer, VectorAssembler
+from pyspark.ml.feature import Tokenizer, VectorAssembler, StopWordsRemover
 from pyspark.ml import Pipeline
-from pyspark.sql.functions import col, size, monotonically_increasing_id
+from pyspark.sql.functions import col, size, length, regexp_replace, split, expr, trim
 from pyspark.ml.classification import LogisticRegression
 from pyspark.ml.evaluation import MulticlassClassificationEvaluator
 from pyspark.sql.types import IntegerType
 
-#ortam degiskenleri deistirmek gerekebilir
 os.environ["HADOOP_HOME"] = "C:\\hadoop"
 os.environ["PATH"] += os.pathsep + "C:\\hadoop\\bin"
 os.environ["PYSPARK_PYTHON"] = "python"
@@ -19,29 +18,74 @@ spark = SparkSession.builder \
 
 spark.sparkContext.setLogLevel("ERROR")
 
-metinler_df = spark.read.text('metinler/*.txt')
-metinler_df = metinler_df.withColumn("id", monotonically_increasing_id())
-metinler_df.show(5)
+metinler_df = spark.read.csv('etiketli_metin.csv', header=True, inferSchema=True)
+metinler_df = metinler_df.filter(trim(col("Metin")) != "")
 
-tokenizer = Tokenizer(inputCol="value", outputCol="kelimeler")
-pipeline = Pipeline(stages=[tokenizer])
-model = pipeline.fit(metinler_df)
-processed_df = model.transform(metinler_df)
+tokenizer = Tokenizer(inputCol="Metin", outputCol="kelimeler")
+metinler_df = tokenizer.transform(metinler_df)
 
-processed_df = processed_df.withColumn("kelime_sayisi", size(col("kelimeler")))
+metinler_df = metinler_df.withColumn("kelime_sayisi", size(col("kelimeler")))
+metinler_df = metinler_df.withColumn("karakter_sayisi", length(col("Metin")))
+metinler_df = metinler_df.withColumn("ortalama_kelime_uzunlugu", (col("karakter_sayisi") / (col("kelime_sayisi") + 1)))              
+metinler_df = metinler_df.withColumn("noktalama_sayisi", length(col("Metin")) - length(regexp_replace(col("Metin"), r"[.,;:!?]", "")))
+metinler_df = metinler_df.withColumn("uzun_kelime_sayisi", expr("size(filter(kelimeler, x -> length(x) > 7))"))
 
-from pyspark.sql.functions import rand
-processed_df = processed_df.withColumn("karmasik_seviyesi", (rand() * 2).cast(IntegerType()))
+remover = StopWordsRemover(inputCol="kelimeler", outputCol="filtered")
+metinler_df = remover.transform(metinler_df)
+metinler_df = metinler_df.withColumn("stopword_sayisi", col("kelime_sayisi") - size(col("filtered")))
+metinler_df = metinler_df.withColumn("cumle_sayisi", size(split(col("Metin"), r"[.!?]")))
+metinler_df = metinler_df.withColumn("karmasik_seviyesi", col("Etiket").cast(IntegerType()))
 
-assembler = VectorAssembler(inputCols=["kelime_sayisi"], outputCol="features")
-processed_df = assembler.transform(processed_df)
+assembler = VectorAssembler(
+    inputCols=[
+        "kelime_sayisi", 
+        "karakter_sayisi", 
+        "ortalama_kelime_uzunlugu", 
+        "noktalama_sayisi",
+        "uzun_kelime_sayisi",
+        "stopword_sayisi",
+        "cumle_sayisi",
+    ],
+    outputCol="features"
+)
+metinler_df = assembler.transform(metinler_df)
 
 lr = LogisticRegression(featuresCol="features", labelCol="karmasik_seviyesi")
-model = lr.fit(processed_df)
+lr_model = lr.fit(metinler_df)
 
-predictions = model.transform(processed_df)
-predictions.select("value", "kelime_sayisi", "prediction").show(5)
+dogrulama_df = spark.read.csv('dogrulama_metin.csv', header=True, inferSchema=True)
+dogrulama_df = dogrulama_df.filter(trim(col("Metin")) != "")
+dogrulama_df = tokenizer.transform(dogrulama_df)
 
-evaluator = MulticlassClassificationEvaluator(labelCol="karmasik_seviyesi", predictionCol="prediction", metricName="accuracy")
-accuracy = evaluator.evaluate(predictions)
+dogrulama_df = dogrulama_df.withColumn("kelime_sayisi", size(col("kelimeler")))
+dogrulama_df = dogrulama_df.withColumn("karakter_sayisi", length(col("Metin")))
+dogrulama_df = dogrulama_df.withColumn("ortalama_kelime_uzunlugu", (col("karakter_sayisi") / (col("kelime_sayisi") + 1)))              
+dogrulama_df = dogrulama_df.withColumn("noktalama_sayisi", length(col("Metin")) - length(regexp_replace(col("Metin"), r"[.,;:!?]", "")))
+dogrulama_df = dogrulama_df.withColumn("uzun_kelime_sayisi", expr("size(filter(kelimeler, x -> length(x) > 7))"))
+
+dogrulama_df = remover.transform(dogrulama_df)
+dogrulama_df = dogrulama_df.withColumn("stopword_sayisi", col("kelime_sayisi") - size(col("filtered")))
+dogrulama_df = dogrulama_df.withColumn("cumle_sayisi", size(split(col("Metin"), r"[.!?]")))
+dogrulama_df = dogrulama_df.withColumn("karmasik_seviyesi", col("Etiket").cast(IntegerType()))
+
+dogrulama_df = assembler.transform(dogrulama_df)
+tahminler = lr_model.transform(dogrulama_df)
+
+tahminler.select("Metin", "karmasik_seviyesi", "prediction").show(30)
+
+evaluator = MulticlassClassificationEvaluator(
+    labelCol="karmasik_seviyesi", 
+    predictionCol="prediction", 
+    metricName="accuracy"
+)
+accuracy = evaluator.evaluate(tahminler)
+
+f1_evaluator = MulticlassClassificationEvaluator(
+    labelCol="karmasik_seviyesi",
+    predictionCol="prediction",
+    metricName="f1"
+)
+f1_score = f1_evaluator.evaluate(tahminler)
+
+print(f"F1 Skoru: {f1_score}")
 print(f"Modelin dogrulugu: {accuracy}")
